@@ -1,3 +1,13 @@
+*   Run `ActionController::Live` actions on a fiber under a fiber scheduler.
+
+    When a fiber scheduler is running and `active_support.isolation_level` is
+    `:fiber`, as on Falcon, Live actions now run on a fiber on the request's
+    thread instead of a thread from Live's pool. Request state such as
+    `CurrentAttributes` is visible in the action, and open streams no longer
+    add a thread each. Other setups keep using the thread pool.
+
+    *Joel Junström*
+
 *   Don't render authenticity tokens under the `:header_only` CSRF strategy.
 
     `:header_only` verifies requests by their `Sec-Fetch-Site` header and never

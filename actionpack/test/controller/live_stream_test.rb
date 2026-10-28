@@ -4,6 +4,7 @@ require "abstract_unit"
 require "timeout"
 require "concurrent/atomic/count_down_latch"
 require "zeitwerk"
+require_relative "../support/fiber_scheduler"
 
 Thread.abort_on_exception = true
 
@@ -121,7 +122,7 @@ module ActionController
     class TestController < ActionController::Base
       include ActionController::Live
 
-      attr_accessor :latch, :tc, :error_latch
+      attr_accessor :latch, :tc, :error_latch, :events
 
       def self.controller_path
         "test"
@@ -196,6 +197,20 @@ module ActionController
           latch.wait
         end
         response.stream.close
+      end
+
+      def current_thread
+        render plain: Thread.current.object_id.to_s
+      end
+
+      def write_after_disconnect
+        response.stream.write "hello"
+        latch.wait
+        response.stream.write "world"
+      rescue ClientDisconnected
+        events << :client_disconnected
+      ensure
+        events << :ensure
       end
 
       def write_sleep_autoload
@@ -357,6 +372,24 @@ module ActionController
       ensure
         ActionController::Base.logger = old_logger
       end
+    end
+
+    def in_fiber_scheduler(isolation_level: :fiber)
+      previous_level = ActiveSupport::IsolatedExecutionState.isolation_level
+      ActiveSupport::IsolatedExecutionState.isolation_level = isolation_level
+      error = nil
+
+      Fiber.set_scheduler(FiberScheduler.new)
+      Fiber.schedule do
+        yield
+      rescue Exception => error
+      end
+      Fiber.set_scheduler(nil)
+
+      raise error if error
+    ensure
+      Fiber.set_scheduler(nil)
+      ActiveSupport::IsolatedExecutionState.isolation_level = previous_level
     end
 
     def setup
@@ -593,6 +626,74 @@ module ActionController
       assert_stream_closed
     ensure
       ActiveSupport::IsolatedExecutionState.isolation_level = previous_level
+    end
+
+    def test_action_runs_on_the_request_thread_under_a_fiber_scheduler
+      in_fiber_scheduler do
+        get :current_thread
+        assert_equal Thread.current.object_id.to_s, response.body
+      end
+    end
+
+    def test_action_streams_in_chunks_under_a_fiber_scheduler
+      @controller.latch = Concurrent::CountDownLatch.new
+      parts = []
+
+      in_fiber_scheduler do
+        get :blocking_stream
+
+        response.stream.each do |part|
+          parts << part
+          latch = @controller.latch
+          @controller.latch = Concurrent::CountDownLatch.new
+          latch.count_down
+        end
+      end
+
+      assert_equal ["hello", "world"], parts
+    end
+
+    def test_isolated_state_get_copied_under_a_fiber_scheduler
+      in_fiber_scheduler do
+        CurrentState.id = "isolated_state"
+
+        get :isolated_state
+        assert_equal "isolated_state".inspect, response.body
+        assert_stream_closed
+      end
+    end
+
+    def test_client_disconnect_under_a_fiber_scheduler
+      @controller.latch = Concurrent::CountDownLatch.new
+      @controller.events = []
+
+      in_fiber_scheduler do
+        get :write_after_disconnect
+
+        _, _, body = response.to_a
+        body.each do
+          body.close
+          break
+        end
+        @controller.latch.count_down
+      end
+
+      assert_equal [:client_disconnected, :ensure], @controller.events
+    end
+
+    def test_exception_in_controller_before_streaming_under_a_fiber_scheduler
+      in_fiber_scheduler do
+        assert_raises(ActionController::LiveStreamTest::Exception) do
+          get :exception_in_controller, format: "text/event-stream"
+        end
+      end
+    end
+
+    def test_thread_isolation_uses_a_separate_thread_under_a_fiber_scheduler
+      in_fiber_scheduler(isolation_level: :thread) do
+        get :current_thread
+        assert_not_equal Thread.current.object_id.to_s, response.body
+      end
     end
 
     def test_connected_to_stack_not_inherited
