@@ -35,7 +35,9 @@ module ActionController
   #
   # The final caveat is that your actions are executed in a separate thread than
   # the main thread. Make sure your actions are thread safe, and this shouldn't be
-  # a problem (don't share state across threads, etc).
+  # a problem (don't share state across threads, etc). Under a fiber scheduler with
+  # `config.active_support.isolation_level = :fiber`, as on Falcon, they run in a
+  # separate fiber on the request's thread instead.
   #
   # Note that Rails includes `Rack::ETag` by default, which will buffer your
   # response. As a result, streaming responses may not work properly with Rack
@@ -55,8 +57,8 @@ module ActionController
   #
   # ## Streaming and Execution State
   #
-  # When streaming, the action is executed in a separate thread. By default, this thread
-  # shares execution state from the parent thread.
+  # When streaming, the action is executed in a separate thread or fiber. By default, it
+  # shares execution state from the request.
   #
   # You can configure which execution state keys should be excluded from being shared
   # using the `config.action_controller.live_streaming_excluded_keys` configuration:
@@ -412,13 +414,18 @@ module ActionController
     private
       # Spawn a new thread to serve up the controller in. This is to get around the
       # fact that Rack isn't based around IOs and we need to use a thread to stream
-      # data from the response bodies. Nobody should call this method except in Rails
-      # internals. Seriously!
+      # data from the response bodies. Under a fiber scheduler with fiber isolation,
+      # spawn a fiber on the request's thread instead. Nobody should call this method
+      # except in Rails internals. Seriously!
       def new_controller_thread(&block) # :nodoc:
-        ActionController::Live.live_thread_pool_executor.post do
-          t2 = Thread.current
-          t2.abort_on_exception = true
-          yield
+        if Fiber.current_scheduler && ActiveSupport::IsolatedExecutionState.isolation_level == :fiber
+          Fiber.schedule(&block)
+        else
+          ActionController::Live.live_thread_pool_executor.post do
+            t2 = Thread.current
+            t2.abort_on_exception = true
+            yield
+          end
         end
       end
 
